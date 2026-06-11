@@ -327,6 +327,66 @@ let main : Nat
         result = bevaluate(compiled['Test.main'])
         self.assertEqual(result, 10)
 
+    def test_self_ref_capture_in_do_lowering(self):
+        """Regression for self-reference handling when lowering an effectful
+        `do`-bind to open-CPS. Exercises both directions of the decision.
+
+        Background: `_compile_do` builds fresh outer/inner continuation laws and
+        captures the do's free *locals* into them. A self-reference resolves to
+        N(0) ("the current law") — but only when the enclosing law takes
+        arguments. Two failure modes, opposite branches of the same `uses_self`
+        decision:
+
+        (1) arity > 0 — a self-call inside a `match` arm in CPS-tail position
+            (the body of a do's continuation): N(0) inside the *new*
+            continuation law points at that law, not the recursive function, so
+            the self-call was mis-targeted to an unsaturated law (garbage). The
+            self-reference must be threaded in as an explicit capture.
+
+        (2) arity == 0 — a top-level recursive *value* whose `do` references
+            itself: here the self-ref resolves as a global pin, not N(0), so no
+            capture is needed. Capturing anyway adds a self slot the top-level
+            return path never fills — also garbage. So `uses_self` must stay
+            False at arity 0.
+
+        Values ride on constructor payloads / literals (no predecessor-binding
+        `nn` arm) so the expected results are unambiguous.
+        """
+        # (1) capture needed: loop recurses in the RGo arm → 42
+        capture = """
+eff E { op : Nat → Resp }
+type Resp = | RStop Nat | RGo Nat
+
+let loop : Nat → Nat
+  = fn st → (resp ← op st in
+              match resp { | RStop vv → pure vv
+                           | RGo aa  → loop aa })
+
+let main : Nat
+  = run (handle (loop 0) {
+      | return vv → vv
+      | op aa kk → match aa { | 0  → kk (RGo 1)
+                              | nn → kk (RStop 42) } })
+"""
+        self.assertEqual(bevaluate(compile_via_bootstrap(capture)['Test.main']), 42)
+
+        # (2) no over-capture at top level: `go` is a recursive value (arity 0)
+        # whose do references itself → 7
+        toplevel = """
+eff E { op : Nat → Resp }
+type Resp = | RStop Nat | RGo Nat
+
+let go : Nat
+  = (resp ← op 0 in
+      match resp { | RStop vv → pure vv
+                   | RGo aa  → go })
+
+let main : Nat
+  = run (handle go { | return vv → vv
+                     | op aa kk → kk (RStop 7) })
+"""
+        self.assertEqual(bevaluate(compile_via_bootstrap(toplevel)['Test.main']), 7)
+
 
 # ---------------------------------------------------------------------------
 # Test: GLS compiler self-hosting regression

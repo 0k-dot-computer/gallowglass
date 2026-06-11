@@ -3686,21 +3686,50 @@ class Compiler:
         free_locals = [k for k in env.locals if k in all_free]
         n_cap = len(free_locals)
 
-        # Indices in the outer (n_cap+2)-arg law
-        outer_dispatch_idx = n_cap + 1
-        outer_k_open_idx   = n_cap + 2
+        # Self-reference capture.  The recursive self-ref resolves to N(0) (the
+        # *current* law) via `_compile_var`.  The inner/outer continuation laws
+        # built below are NEW laws, so their N(0) points at themselves, not at
+        # the enclosing recursive function.  If the do's rhs/body references the
+        # self-ref, it must therefore be threaded in as an explicit leading
+        # capture (slot 1) and the new envs must resolve the self-name via that
+        # slot, NOT via self_ref_name → N(0).  Mirrors `_build_field_arm_law`'s
+        # uses_self handling.  Without this, a recursive call inside a match arm
+        # within a do-continuation calls the continuation law instead of the
+        # recursive function (garbage / unsaturated-law results).
+        #
+        # Guard on `env.arity > 0`: a self-ref only resolves to N(0) when the
+        # enclosing law takes arguments (see `_compile_var`, whose N(0) path is
+        # gated by `env.arity > 0`).  At top level (arity 0 — a recursive *value*)
+        # the self-ref resolves as a global pin instead, so no capture is needed,
+        # and the `env.arity == 0` branch below relies on `uses_self` being False
+        # (it returns the bare do_law and never fills a self slot).
+        uses_self = env.arity > 0 and bool(env.self_ref_name) and (
+            self._body_uses_self_ref(expr.rhs, env)
+            or self._body_uses_self_ref(expr.body, env)
+        )
+        base = 1 if uses_self else 0  # self occupies slot 1; captures shift after
 
-        # Indices in the inner (n_cap+3)-arg continuation law
+        # Indices in the outer (base+n_cap+2)-arg law
+        outer_dispatch_idx = base + n_cap + 1
+        outer_k_open_idx   = base + n_cap + 2
+
+        # Indices in the inner (base+n_cap+3)-arg continuation law
         # Reordered: k_open_outer BEFORE dispatch so partial application
         # with (caps, k_open_outer) gives a 2-arg open continuation.
-        inner_k_open_idx   = n_cap + 1
-        inner_dispatch_idx = n_cap + 2
-        inner_x_idx        = n_cap + 3
+        inner_k_open_idx   = base + n_cap + 1
+        inner_dispatch_idx = base + n_cap + 2
+        inner_x_idx        = base + n_cap + 3
+
+        def _bind_self(e: Env) -> None:
+            if uses_self:
+                e.locals[env.self_ref_name] = 1
+                e.locals[env.self_ref_name.split('.')[-1]] = 1
 
         # --- Build inner continuation law ---
-        inner_env = Env(globals=env.globals, arity=n_cap + 3,
-                        self_ref_name=env.self_ref_name)
-        for i, fv in enumerate(free_locals, 1):
+        inner_env = Env(globals=env.globals, arity=base + n_cap + 3,
+                        self_ref_name='' if uses_self else env.self_ref_name)
+        _bind_self(inner_env)
+        for i, fv in enumerate(free_locals, base + 1):
             inner_env.locals[fv] = i
         inner_env.locals['__dispatch__'] = inner_dispatch_idx
         inner_env.locals['__k__']        = inner_k_open_idx
@@ -3709,36 +3738,44 @@ class Compiler:
         body_cps = self._compile_expr(expr.body, inner_env, name_hint + '_body')
         # Apply body_cps to dispatch and k_open_outer
         inner_body = bapp(bapp(body_cps, N(inner_dispatch_idx)), N(inner_k_open_idx))
-        inner_law  = P(L(n_cap + 3, encode_name(name_hint + '_cont'), inner_body))
+        inner_law  = P(L(base + n_cap + 3, encode_name(name_hint + '_cont'), inner_body))
 
         # --- Build outer 2-arg (+ captures) law ---
-        outer_env = Env(globals=env.globals, arity=n_cap + 2,
-                        self_ref_name=env.self_ref_name)
-        for i, fv in enumerate(free_locals, 1):
+        outer_env = Env(globals=env.globals, arity=base + n_cap + 2,
+                        self_ref_name='' if uses_self else env.self_ref_name)
+        _bind_self(outer_env)
+        for i, fv in enumerate(free_locals, base + 1):
             outer_env.locals[fv] = i
         outer_env.locals['__dispatch__'] = outer_dispatch_idx
         outer_env.locals['__k__']        = outer_k_open_idx
 
         rhs_val = self._compile_expr(expr.rhs, outer_env, name_hint + '_rhs')
 
-        # Partially apply inner_law to captures + k_open_outer (NOT dispatch).
-        # Result is a 2-arg open continuation: (dispatch, x) → body(dispatch, k_open_outer)
+        # Partially apply inner_law to [self?] + captures + k_open_outer (NOT
+        # dispatch).  Values come from the OUTER law's slots: self at slot 1,
+        # free_locals at slots base+1.., k_open at outer_k_open_idx.  Result is a
+        # 2-arg open continuation: (dispatch, x) → body(dispatch, k_open_outer).
         inner_cont_open = inner_law
+        if uses_self:
+            inner_cont_open = bapp(inner_cont_open, N(1))
         for i in range(1, n_cap + 1):
-            inner_cont_open = bapp(inner_cont_open, N(i))
+            inner_cont_open = bapp(inner_cont_open, N(base + i))
         inner_cont_open = bapp(inner_cont_open, N(outer_k_open_idx))
 
         # Outer body: rhs_comp dispatch inner_cont_open
         outer_body = bapp(bapp(rhs_val, N(outer_dispatch_idx)), inner_cont_open)
-        do_law     = L(n_cap + 2, encode_name(name_hint + '_do'), outer_body)
+        do_law     = L(base + n_cap + 2, encode_name(name_hint + '_do'), outer_body)
 
         if env.arity == 0:
-            # At top level: partially apply to captures (usually none)
+            # At top level: no self_ref (uses_self is False); partially apply to
+            # captures (usually none).
             result = do_law
             for fv in free_locals:
                 result = A(result, env.globals.get(fv, N(0)))
         else:
             result = P(do_law)
+            if uses_self:
+                result = bapp(result, N(0))  # capture the enclosing law's self
             for fv in free_locals:
                 result = bapp(result, N(env.locals[fv]))
         return result

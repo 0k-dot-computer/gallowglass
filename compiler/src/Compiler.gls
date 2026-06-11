@@ -7627,54 +7627,92 @@ let cg_compile_do
                   let all_found = append rhs_free body_free in
                   let free_vars = cg_keep_free_locals (cenv_locals env) all_found Nil in
                   let n_cap = length free_vars in
-                  -- Outer law: arity = n_cap + 2
-                  let outer_dispatch_idx = add n_cap 1 in
-                  let outer_k_open_idx   = add n_cap 2 in
-                  -- Inner continuation: arity = n_cap + 3
-                  -- Reordered: [caps, k_open_outer, dispatch, x]
-                  let inner_k_open_idx   = add n_cap 1 in
-                  let inner_dispatch_idx = add n_cap 2 in
-                  let inner_x_idx        = add n_cap 3 in
+                  -- Self-reference capture (mirrors bootstrap _compile_do).  The
+                  -- recursive self-ref resolves to N(0) = the *current* law; the
+                  -- inner/outer continuation laws are NEW laws whose N(0) points
+                  -- at themselves, so a self-ref used in rhs/body must be threaded
+                  -- in as a leading capture (slot 1) and the new envs must clear
+                  -- self_ref (None) so the name resolves via the slot.  Without
+                  -- this, a recursive call inside a match arm within a
+                  -- do-continuation calls the continuation law instead of the
+                  -- recursive function.  `base` = 1 if self used, else 0.
+                  -- Guard on arity > 0: a self-ref only resolves to N(0) when the
+                  -- enclosing law takes arguments; at top level (arity 0) it
+                  -- resolves as a global pin, so no capture is needed and the
+                  -- arity-0 branch below relies on uses_self = 0.
+                  let uses_self = match (nat_eq (cenv_arity env) 0) {
+                                    | 0 → match (cg_body_uses_self rhs env) {
+                                            | 0 → cg_body_uses_self body env
+                                            | _ → 1
+                                          }
+                                    | _ → 0
+                                  } in
+                  let base = uses_self in
+                  -- Outer law: arity = base + n_cap + 2
+                  let outer_dispatch_idx = add (add base n_cap) 1 in
+                  let outer_k_open_idx   = add (add base n_cap) 2 in
+                  -- Inner continuation: arity = base + n_cap + 3
+                  -- Reordered: [self?, caps, k_open_outer, dispatch, x]
+                  let inner_k_open_idx   = add (add base n_cap) 1 in
+                  let inner_dispatch_idx = add (add base n_cap) 2 in
+                  let inner_x_idx        = add (add base n_cap) 3 in
                   -- Sub-law / sub-compile hints (match Python's suffix scheme).
-                  -- Suffix nats are hoisted top-level (see nn_*_suffix
-                  -- definitions near virtual_resume_idx).
                   let body_hint  = cg_concat_under hint nn_body_suffix in
                   let rhs_hint   = cg_concat_under hint nn_rhs_suffix in
                   let cont_name  = cg_concat_under hint nn_cont_suffix in
                   let do_name    = cg_concat_under hint nn_do_suffix in
-                  -- Build inner env
                   let g = cenv_globals env in
-                  let inner_env0 = cenv_make g Nil 0 None in
-                  let inner_env1 = cg_bind_params free_vars inner_env0 in
-                  let inner_env2 = cenv_set_arity inner_env1 (add n_cap 3) in
+                  -- Fresh in-law env (self cleared) with the self-ref bound at
+                  -- slot 1 when used (mirrors cg_make_pred_succ_law's idiom).
+                  let mk_self_env = λ dummy → match (nat_eq uses_self 0) {
+                        | 0 →
+                            match (cenv_self env) {
+                              | None → cenv_make g Nil 0 None
+                              | Some fq →
+                                  let e1 = cenv_new_param (cenv_make g Nil 0 None) fq in
+                                  let short = cg_short_after_dot fq in
+                                  match (Reaver.BPLAN.eq short fq) {
+                                    | 0 → cenv_bind_local e1 short (cenv_arity e1)
+                                    | _ → e1
+                                  }
+                            }
+                        | _ → cenv_make g Nil 0 None
+                      } in
+                  -- Build inner env
+                  let inner_envS = mk_self_env 0 in
+                  let inner_env1 = cg_bind_params free_vars inner_envS in
+                  let inner_env2 = cenv_set_arity inner_env1 (add (add base n_cap) 3) in
                   let inner_env3 = cenv_bind_local inner_env2 bind_name inner_x_idx in
-                  -- Compile body in inner env
                   let body_cps = ce body inner_env3 ctab body_hint in
-                  -- Inner body: body_cps(dispatch, k_open_outer)
                   let inner_body = cg_bapp (cg_bapp body_cps (PNat inner_dispatch_idx)) (PNat inner_k_open_idx) in
-                  let inner_law = PPin (PLaw cont_name (MkPair (add n_cap 3) inner_body)) in
+                  let inner_law = PPin (PLaw cont_name (MkPair (add (add base n_cap) 3) inner_body)) in
                   -- Build outer env
-                  let outer_env0 = cenv_make g Nil 0 None in
-                  let outer_env1 = cg_bind_params free_vars outer_env0 in
-                  let outer_env  = cenv_set_arity outer_env1 (add n_cap 2) in
-                  -- Compile rhs in outer env
+                  let outer_envS = mk_self_env 0 in
+                  let outer_env1 = cg_bind_params free_vars outer_envS in
+                  let outer_env  = cenv_set_arity outer_env1 (add (add base n_cap) 2) in
                   let rhs_val = ce rhs outer_env ctab rhs_hint in
-                  -- Apply inner_law to captures + k_open_outer (NOT dispatch).
-                  -- Result is a 2-arg open continuation: (dispatch, x) → body(dispatch, k_open_outer)
-                  let inner_applied = cg_apply_range inner_law 1 n_cap in
+                  -- Apply inner_law to [self?] + captures + k_open_outer.  Values
+                  -- come from the OUTER law: self at slot 1, free_vars at
+                  -- base+1..base+n_cap, k_open at outer_k_open_idx.
+                  let inner_self_applied = match (nat_eq uses_self 0) {
+                                             | 0 → cg_bapp inner_law (PNat 1)
+                                             | _ → inner_law
+                                           } in
+                  let inner_applied = cg_apply_range inner_self_applied (add base 1) (add base n_cap) in
                   let inner_cont_open = cg_bapp inner_applied (PNat outer_k_open_idx) in
-                  -- Outer body: rhs_comp(dispatch, inner_cont_open)
                   let outer_body = cg_bapp (cg_bapp rhs_val (PNat outer_dispatch_idx)) inner_cont_open in
-                  let do_law = PLaw do_name (MkPair (add n_cap 2) outer_body) in
-                  -- At top level (env.arity == 0): return bare ``do_law``;
-                  -- captures from env.locals are necessarily empty so there is
-                  -- nothing further to apply.  Inside another law: pin and
-                  -- bapp-apply free-local captures.  Mirrors Python's
-                  -- ``if env.arity == 0`` branch in _compile_do.
+                  let do_law = PLaw do_name (MkPair (add (add base n_cap) 2) outer_body) in
+                  -- Inside another law: pin, capture self (N(0)) if used, then
+                  -- bapp-apply free-local captures.  At top level (arity 0) there
+                  -- is no self-ref and captures are empty.  Mirrors Python.
                   match (nat_eq (cenv_arity env) 0) {
                     | 0 →
                         let pinned = PPin do_law in
-                        cg_apply_free_locals pinned free_vars env
+                        let pinned_self = match (nat_eq uses_self 0) {
+                                            | 0 → cg_bapp pinned (PNat 0)
+                                            | _ → pinned
+                                          } in
+                        cg_apply_free_locals pinned_self free_vars env
                     | _ → do_law
                   }
             }
